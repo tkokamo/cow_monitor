@@ -18,8 +18,9 @@ int main()
     exit(1);
   }
 
-  cow.pid = (pid_t)630;
-  cow.addr = (void *)0x7f29aa7ed000;
+  cow.pid = (pid_t)711;
+  cow.addr = (void *)0x7f7b73473000;
+  cow.len = 100;
   ret_val = ioctl(fd, IOCTL_COW_MONITOR, &cow);
   if (ret_val < 0) {
     printf("ioctl failed: %d\n", ret_val);
