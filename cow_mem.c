@@ -11,15 +11,21 @@
 #include <linux/slab.h>
 #include <linux/mman.h>
 #include <linux/sysctl.h>
+#include <linux/security.h>
 #include <linux/rbtree.h>
 #include <linux/mempolicy.h>
 #include <linux/err.h>
 #include <linux/rcupdate.h>
 #include <linux/nodemask.h>
+#include <linux/compiler.h>
+#include <linux/capability.h>
 #include <linux/cpumask.h>
 #include <linux/cgroup.h>
 #include <linux/rmap.h>
 #include <linux/rbtree.h>
+#include <linux/autoconf.h>
+#include <uapi/linux/capability.h>
+
 
 #include "cow_monitor.h"
 #define DEVICE_NAME "cow_monitor" 
@@ -157,8 +163,8 @@ static inline unsigned long
 calc_mmap_flag_bits(unsigned long flags)
 {
   return _calc_vm_trans(flags, VM_GROWSDOWN, MAP_GROWSDOWN) | 
-         _calc_vm_trans(flags, VM_DENYWRITE, MAP_DENYWRITE) |
-         _calc_vm_trans(flags, VM_LOCKED, MAP_LOCKED);
+    _calc_vm_trans(flags, VM_DENYWRITE, MAP_DENYWRITE) |
+    _calc_vm_trans(flags, VM_LOCKED, MAP_LOCKED);
 }
 
 static inline unsigned long
@@ -178,9 +184,49 @@ calc_vm_flag_bits(unsigned long flags)
     _calc_vm_trans(flags, MAP_LOCKED,     VM_LOCKED    );
 }
 
+static inline unsigned long task_rlimit(const struct task_struct *tsk,
+					unsigned int limit)
+{
+  return ACCESS_ONCE(tsk->signal->rlim[limit].rlim_cur);
+}
+
+
+static inline unsigned long rlimit(unsigned int limit)
+{
+  return task_rlimit(current, limit);
+}  
+
+static inline unsigned long cow_round_hint_to_min(unsigned long hint)
+{
+  hint &= PAGE_MASK;
+  if (((void *)hint != NULL) &&
+      (hint < CONFIG_DEFAULT_MMAP_MIN_ADDR))
+    return PAGE_ALIGN(CONFIG_DEFAULT_MMAP_MIN_ADDR);
+  return hint;
+}
+
+static inline int cow_mlock_future_check(struct mm_struct *mm,
+                                     unsigned long flags,
+                                     unsigned long len)
+{
+  unsigned long locked, lock_limit;
+
+  /*  mlock MCL_FUTURE? */
+  if (flags & VM_LOCKED) {
+    locked = len >> PAGE_SHIFT;
+    locked += mm->locked_vm;
+    lock_limit = rlimit(RLIMIT_MEMLOCK);
+    lock_limit >>= PAGE_SHIFT;      
+    if (locked > lock_limit && !capable(CAP_IPC_LOCK))
+      return -EAGAIN;
+  }
+  return 0;
+}
+
 
 unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flagst vm_flags, unsigned long pgoff)
 {
+  
 
   vma->vm_mm = mm;
   vma->vm_start = addr;
@@ -192,7 +238,7 @@ unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flagst v
 
 }
 
-unsigned long cow_mmap(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long vm_flags, unsigned long prot)
+unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long vm_flags, unsigned long prot)
 {
   unsigned long vm_flags;
 
@@ -201,6 +247,10 @@ unsigned long cow_mmap(unsigned long addr, unsigned long len, unsigned long prot
     return -EINVAL;
   }
  
+
+  if (!(flags & MAP_FIXED))
+    addr = cow_round_hint_to_min(addr);
+
   len = PAGE_ALIGN(len);
   if (!len) {
     printk(KERN_ALERT "length overflowed\n");
@@ -217,6 +267,13 @@ unsigned long cow_mmap(unsigned long addr, unsigned long len, unsigned long prot
   if (addr & ~PAGE_MASK)
     return addr;
 
+  
+  if (flags & MAP_LOCKED)
+    if (!can_do_mlock())
+      return -EPERM;
+
+  if (cow_mlock_future_check(current, vm_flags, len))
+    return -EAGAIN;
   
   addr = cow_mmap_region(NULL, addr, len, vm_flags, pgoff);
   if (!IS_ERR_VALUE(addr) &&
