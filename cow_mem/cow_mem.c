@@ -46,6 +46,9 @@
 #include <linux/percpu_counter.h>
 #include <linux/mount.h>
 #include <linux/printk.h>
+#include <linux/backing-dev.h>
+#include <linux/kconfig.h>
+#include <linux/interval_tree_generic.h>
 
 #include "cow_mem.h"
 #define DEVICE_NAME "cow_monitor" 
@@ -308,6 +311,20 @@ int cow_shmem_zero_setup(struct vm_area_struct *vma)
   return 0;
 }
 
+static inline unsigned long vma_start_pgoff(struct vm_area_struct *v)
+{
+  return v->vm_pgoff;
+}
+
+static inline unsigned long vma_last_pgoff(struct vm_area_struct *v)
+{
+  return v->vm_pgoff + ((v->vm_end - v->vm_start) >> PAGE_SHIFT) - 1;
+}
+
+INTERVAL_TREE_DEFINE(struct vm_area_struct, shared.linear.rb,
+                     unsigned long, shared.linear.rb_subtree_last,
+                     vma_start_pgoff, vma_last_pgoff,, vma_interval_tree)
+
 static void __vma_link_file(struct vm_area_struct *vma)
 {
   struct file *file;
@@ -476,6 +493,73 @@ struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
   return &gate_vma;
 }
 
+void vm_stat_account(struct mm_struct *mm, unsigned long flags,
+		     struct file *file, long pages)
+{
+        const unsigned long stack_flags
+	  = VM_STACK_FLAGS & (VM_GROWSUP|VM_GROWSDOWN);
+
+        mm->total_vm += pages;
+
+        if (file) {
+	  mm->shared_vm += pages;
+	  if ((flags & (VM_EXEC|VM_WRITE)) == VM_EXEC)
+	    mm->exec_vm += pages;
+        } else if (flags & stack_flags)
+	  mm->stack_vm += pages;
+}
+
+
+static pgprot_t vm_pgprot_modify(pgprot_t oldprot, unsigned long vm_flags)
+{
+  return pgprot_modify(oldprot, vm_get_page_prot(vm_flags));
+}
+
+#define pgprot_val(x)   ((x).pgprot)
+
+int vma_wants_writenotify(struct vm_area_struct *vma)
+{
+  vm_flags_t vm_flags = vma->vm_flags;
+        
+  /* If it was private or non-writable, the write bit is already clear */
+  if ((vm_flags & (VM_WRITE|VM_SHARED)) != ((VM_WRITE|VM_SHARED)))
+    return 0;
+
+  /* The backer wishes to know when pages are first written to? */
+  if (vma->vm_ops && vma->vm_ops->page_mkwrite)
+    return 1;
+
+  /* The open routine did something to the protections that pgprot_modify
+   * won't preserve? */
+  if (pgprot_val(vma->vm_page_prot) !=
+      pgprot_val(vm_pgprot_modify(vma->vm_page_prot, vm_flags)))
+    return 0;
+
+  /* Do we need to track softdirty? */
+  if (IS_ENABLED(CONFIG_MEM_SOFT_DIRTY) && !(vm_flags & VM_SOFTDIRTY))
+    return 1;
+ 
+  /* Specialty mapping? */
+  if (vm_flags & VM_PFNMAP)
+    return 0;
+
+  /* Can the mapping track the dirty pages? */
+        return vma->vm_file && vma->vm_file->f_mapping &&
+	  mapping_cap_account_dirty(vma->vm_file->f_mapping);
+}
+
+/* Update vma->vm_page_prot to reflect vma->vm_flags. */
+void vma_set_page_prot(struct vm_area_struct *vma)
+{                                               
+  unsigned long vm_flags = vma->vm_flags;
+
+  vma->vm_page_prot = vm_pgprot_modify(vma->vm_page_prot, vm_flags);
+  if (vma_wants_writenotify(vma)) {
+    vm_flags &= ~VM_SHARED;
+    vma->vm_page_prot = vm_pgprot_modify(vma->vm_page_prot,
+					 vm_flags);
+  }       
+}  
 
 unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t vm_flags, unsigned long pgoff)
 {
