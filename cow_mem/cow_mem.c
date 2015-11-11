@@ -674,7 +674,7 @@ unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned 
 }
 
 
-long device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
+void * device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
   struct task_struct *ptr;
   struct mm_struct *target_mm, *current_mm;
@@ -737,6 +737,10 @@ long device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl
     ////////////////////////////////
     addr = cow_do_mmap_pgoff(0, cow->len, prot, flags, target_vm->vm_flags, 0);
     printk("addr is %p\n", addr);
+    if (target_mm != current_mm) up_write(&current_mm->mmap_sem);
+    up_write(&target_mm->mmap_sem);
+
+    return addr;
   }
   retval = 0;
  free_out:
