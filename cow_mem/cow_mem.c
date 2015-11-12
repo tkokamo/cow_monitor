@@ -740,7 +740,9 @@ void * device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
     if (target_mm != current_mm) up_write(&current_mm->mmap_sem);
     up_write(&target_mm->mmap_sem);
 
-    return addr;
+    cow->ret_addr = addr;
+    return addr
+;
   }
   retval = 0;
  free_out:
