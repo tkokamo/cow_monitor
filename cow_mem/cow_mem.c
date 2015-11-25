@@ -49,6 +49,7 @@
 #include <linux/backing-dev.h>
 #include <linux/kconfig.h>
 #include <linux/interval_tree_generic.h>
+#include <linux/mmu_notifier.h>
 
 #include "cow_mem.h"
 #define DEVICE_NAME "cow_monitor" 
@@ -57,6 +58,9 @@ int sysctl_max_map_count = DEFAULT_MAX_MAP_COUNT;
 struct kmem_cache *vm_area_cachep;
 struct kmem_cache *policy_cache;
 struct kmem_cache *filp_cachep;
+static struct kmem_cache *anon_vma_cachep;
+static struct kmem_cache *anon_vma_chain_cachep;
+
 
 extern struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags);
 
@@ -192,15 +196,6 @@ int vma_dup_policy(struct vm_area_struct *src, struct vm_area_struct *dst)
 // 
 //------------------------------------------
 
-//------------------------------------------
-// Functions for copy pages
-// 
-//------------------------------------------
-
-int copy_vm_pages(struct vm_area_struct *dst_vm, struct vm_area_struct *src_vm)
-{
-  
-}
 
 //------------------------------------------
 // Functions for copy pages
@@ -561,7 +556,7 @@ void vma_set_page_prot(struct vm_area_struct *vma)
   }       
 }  
 
-unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t vm_flags, unsigned long pgoff)
+unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t vm_flags, unsigned long pgoff, struct vm_area_struct *dst_vm)
 {
   /*
 
@@ -584,6 +579,7 @@ unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t 
   // no vma merge
 
   vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+  dst_vm = vma;
   if (!vma) {
     error = -ENOMEM;
     goto unacct_error;
@@ -624,13 +620,14 @@ unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t 
 
   return addr;
  free_vma:
+  dst_vm = NULL;
   kmem_cache_free(vm_area_cachep, vma);
   
  unacct_error:  
   return error;
 }
 
-unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long vm_flags, unsigned long pgoff)
+unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long vm_flags, unsigned long pgoff, struct vm_area_struct *dst_vm)
 {
   //  unsigned long vm_flags;
 
@@ -664,7 +661,7 @@ unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned 
   if (cow_mlock_future_check(current->active_mm, vm_flags, len))
     return -EAGAIN;
   
-  addr = cow_mmap_region(addr, len, vm_flags, pgoff);
+  addr = cow_mmap_region(addr, len, vm_flags, pgoff, dst_vm);
   /*if (!IS_ERR_VALUE(addr) &&
       ((vm_flags & VM_LOCKED) ||
        (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
@@ -673,13 +670,444 @@ unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned 
   return addr;
 }
 
+/*
+static inline struct cpuset *css_cs(struct cgroup_subsys_state *css)
+{
+  return css ? container_of(css, struct cpuset, css) : NULL;
+}
+
+static inline struct cpuset *task_cs(struct task_struct *task)
+{
+  return css_cs(task_css(task, cpuset_cgrp_id));
+}
+
+int current_cpuset_is_being_rebound(void)
+{
+  int ret;
+
+  rcu_read_lock();
+  ret = task_cs(current) == NULL;
+  rcu_read_unlock();
+
+  return ret;
+}
+
+
+
+nodemask_t cpuset_mems_allowed(struct task_struct *tsk)
+{
+  nodemask_t mask;
+
+  mutex_lock(&callback_mutex);
+  rcu_read_lock();
+  guarantee_online_mems(task_cs(tsk), &mask);
+  rcu_read_unlock();
+  mutex_unlock(&callback_mutex);
+
+  return mask;
+}
+
+struct mempolicy *__mpol_dup(struct mempolicy *old)
+{               
+  struct mempolicy *new = kmem_cache_alloc(policy_cache, GFP_KERNEL);
+
+  if (!new)
+    return ERR_PTR(-ENOMEM);
+ 
+ 
+  if (old == current->mempolicy) {
+    task_lock(current);
+    *new = *old;
+    task_unlock(current);
+  } else
+    *new = *old;
+
+  if (current_cpuset_is_being_rebound()) {
+    nodemask_t mems = cpuset_mems_allowed(current);
+    if (new->flags & MPOL_F_REBINDING)
+      mpol_rebind_policy(new, &mems, MPOL_REBIND_STEP2);
+    else
+      mpol_rebind_policy(new, &mems, MPOL_REBIND_ONCE);
+  }
+  atomic_set(&new->refcnt, 1);
+  return new;
+}
+
+int vma_dup_policy(struct vm_area_struct *src, struct vm_area_struct *dst)
+{
+  struct mempolicy *pol = mpol_dup(vma_policy(src));
+
+  if (IS_ERR(pol))
+    return PTR_ERR(pol);
+  dst->vm_policy = pol;
+  return 0;
+}
+*/
+//
+// Level 2 from anon_vma_fork
+//
+static inline unsigned long avc_start_pgoff(struct anon_vma_chain *avc)
+{
+  return vma_start_pgoff(avc->vma);
+}
+
+static inline unsigned long avc_last_pgoff(struct anon_vma_chain *avc)
+{
+  return vma_last_pgoff(avc->vma);
+}
+
+INTERVAL_TREE_DEFINE(struct anon_vma_chain, rb, unsigned long, rb_subtree_last,
+                     avc_start_pgoff, avc_last_pgoff,
+                     static inline, __anon_vma_interval_tree)
+
+void anon_vma_interval_tree_insert(struct anon_vma_chain *node,
+                                   struct rb_root *root)
+{
+  __anon_vma_interval_tree_insert(node, root);
+}
+
+void anon_vma_interval_tree_remove(struct anon_vma_chain *node,
+                                   struct rb_root *root)
+{   
+  __anon_vma_interval_tree_remove(node, root);
+}
+
+static void anon_vma_chain_free(struct anon_vma_chain *anon_vma_chain)
+{                    
+  kmem_cache_free(anon_vma_chain_cachep, anon_vma_chain);
+}
+
+static inline void anon_vma_free(struct anon_vma *anon_vma)
+{
+  VM_BUG_ON(atomic_read(&anon_vma->refcount));
+
+  /*
+   * Synchronize against page_lock_anon_vma_read() such that
+   * we can safely hold the lock without the anon_vma getting
+   * freed.
+   *
+   * Relies on the full mb implied by the atomic_dec_and_test() from
+   * put_anon_vma() against the acquire barrier implied by
+   * down_read_trylock() from page_lock_anon_vma_read(). This orders:
+   *
+   * page_lock_anon_vma_read()    VS      put_anon_vma()
+   *   down_read_trylock()                  atomic_dec_and_test()
+   *   LOCK                                 MB
+   *   atomic_read()                        rwsem_is_locked()
+   *
+   * LOCK should suffice since the actual taking of the lock must
+   * happen _before_ what follows.
+   */
+  might_sleep();
+  if (rwsem_is_locked(&anon_vma->root->rwsem)) {
+    anon_vma_lock_write(anon_vma);
+    anon_vma_unlock_write(anon_vma);
+  }
+
+  kmem_cache_free(anon_vma_cachep, anon_vma);
+}
+
+void __put_anon_vma(struct anon_vma *anon_vma)
+{
+  struct anon_vma *root = anon_vma->root;
+                
+  anon_vma_free(anon_vma);
+  if (root != anon_vma && atomic_dec_and_test(&root->refcount))
+    anon_vma_free(root);
+}
+
+
+//
+// Level 1 from anon_vma_fork
+//
+static inline struct anon_vma_chain *anon_vma_chain_alloc(gfp_t gfp)
+{
+  return kmem_cache_alloc(anon_vma_chain_cachep, gfp);
+}
+
+static inline struct anon_vma *anon_vma_alloc(void)
+{
+  struct anon_vma *anon_vma;
+
+  anon_vma = kmem_cache_alloc(anon_vma_cachep, GFP_KERNEL);
+  if (anon_vma) {
+    atomic_set(&anon_vma->refcount, 1);
+    anon_vma->degree = 1;   /* Reference for first vma */
+    anon_vma->parent = anon_vma;
+    /*
+     * Initialise the anon_vma root to point to itself. If called
+     * from fork, the root will be reset to the parents anon_vma.
+     */
+    anon_vma->root = anon_vma;
+  }
+
+  return anon_vma;
+}
+
+static inline struct anon_vma *lock_anon_vma_root(struct anon_vma *root, struct anon_vma *anon_vma)
+{
+  struct anon_vma *new_root = anon_vma->root;
+  if (new_root != root) {
+    if (WARN_ON_ONCE(root))
+      up_write(&root->rwsem);
+    root = new_root;
+    down_write(&root->rwsem);
+  }
+  return root;
+}
+
+static inline void unlock_anon_vma_root(struct anon_vma *root)
+{
+  if (root)
+    up_write(&root->rwsem);
+}
+
+static void anon_vma_chain_link(struct vm_area_struct *vma,
+                                struct anon_vma_chain *avc,
+                                struct anon_vma *anon_vma)
+{
+  avc->vma = vma;
+  avc->anon_vma = anon_vma;
+  list_add(&avc->same_vma, &vma->anon_vma_chain);
+  anon_vma_interval_tree_insert(avc, &anon_vma->rb_root);
+}
+
+
+void unlink_anon_vmas(struct vm_area_struct *vma)
+{
+  struct anon_vma_chain *avc, *next;
+  struct anon_vma *root = NULL;
+
+  /*
+   * Unlink each anon_vma chained to the VMA.  This list is ordered
+   * from newest to oldest, ensuring the root anon_vma gets freed last.
+   */
+  list_for_each_entry_safe(avc, next, &vma->anon_vma_chain, same_vma) {
+    struct anon_vma *anon_vma = avc->anon_vma;
+
+    root = lock_anon_vma_root(root, anon_vma);
+    anon_vma_interval_tree_remove(avc, &anon_vma->rb_root);
+
+    /*
+     * Leave empty anon_vmas on the list - we'll need
+     * to free them outside the lock.
+     */
+    if (RB_EMPTY_ROOT(&anon_vma->rb_root)) {
+      anon_vma->parent->degree--;
+      continue;
+    }
+
+    list_del(&avc->same_vma);
+    anon_vma_chain_free(avc);
+  }
+  if (vma->anon_vma)
+    vma->anon_vma->degree--;
+  unlock_anon_vma_root(root);
+  /*
+   * Iterate the list once more, it now only contains empty and unlinked
+   * anon_vmas, destroy them. Could not do before due to __put_anon_vma()
+   * needing to write-acquire the anon_vma->root->rwsem.
+   */
+  list_for_each_entry_safe(avc, next, &vma->anon_vma_chain, same_vma) {
+    struct anon_vma *anon_vma = avc->anon_vma;
+
+    BUG_ON(anon_vma->degree);
+    put_anon_vma(anon_vma);
+
+    list_del(&avc->same_vma);
+    anon_vma_chain_free(avc);
+  }
+}
+
+int anon_vma_clone(struct vm_area_struct *dst, struct vm_area_struct *src)
+{
+  struct anon_vma_chain *avc, *pavc;
+  struct anon_vma *root = NULL;
+
+  list_for_each_entry_reverse(pavc, &src->anon_vma_chain, same_vma) {
+    struct anon_vma *anon_vma;
+
+    avc = anon_vma_chain_alloc(GFP_NOWAIT | __GFP_NOWARN);
+    if (unlikely(!avc)) {
+      unlock_anon_vma_root(root);
+      root = NULL;
+      avc = anon_vma_chain_alloc(GFP_KERNEL);
+      if (!avc)
+	goto enomem_failure;
+    }
+    anon_vma = pavc->anon_vma;
+    root = lock_anon_vma_root(root, anon_vma);
+    anon_vma_chain_link(dst, avc, anon_vma);
+
+    /*
+     * Reuse existing anon_vma if its degree lower than two,
+     * that means it has no vma and only one anon_vma child.
+     *
+     * Do not chose parent anon_vma, otherwise first child
+     * will always reuse it. Root anon_vma is never reused:
+     * it has self-parent reference and at least one child.
+     */
+    if (!dst->anon_vma && anon_vma != src->anon_vma &&
+	anon_vma->degree < 2)
+      dst->anon_vma = anon_vma;
+  }
+  if (dst->anon_vma)
+    dst->anon_vma->degree++;
+  unlock_anon_vma_root(root);
+  return 0;
+
+ enomem_failure:
+  /*
+   * dst->anon_vma is dropped here otherwise its degree can be incorrectly
+   * decremented in unlink_anon_vmas().
+   * We can safely do this because callers of anon_vma_clone() don't care
+   * about dst->anon_vma if anon_vma_clone() failed.
+   */
+  dst->anon_vma = NULL;
+  unlink_anon_vmas(dst);
+  return -ENOMEM;
+}
+
+//
+// Level 0 from anon_vma_fork
+//
+int anon_vma_fork(struct vm_area_struct *vma, struct vm_area_struct *pvma)
+{
+  struct anon_vma_chain *avc;
+  struct anon_vma *anon_vma;
+  int error;
+
+  /* Don't bother if the parent process has no anon_vma here. */
+  if (!pvma->anon_vma)
+    return 0;
+
+  /* Drop inherited anon_vma, we'll reuse existing or allocate new. */
+  vma->anon_vma = NULL;
+
+  /*
+   * First, attach the new VMA to the parent VMA's anon_vmas,
+   * so rmap can find non-COWed pages in child processes.
+   */
+  error = anon_vma_clone(vma, pvma);
+  if (error)
+    return error;
+
+  /* An existing anon_vma has been reused, all done then. */
+  if (vma->anon_vma)
+    return 0;
+
+  /* Then add our own anon_vma. */
+  anon_vma = anon_vma_alloc();
+  if (!anon_vma)
+    goto out_error;
+  avc = anon_vma_chain_alloc(GFP_KERNEL);
+  if (!avc)
+    goto out_error_free_anon_vma;
+
+  /*
+   * The root anon_vma's spinlock is the lock actually used when we
+   * lock any of the anon_vmas in this anon_vma tree.
+   */
+  anon_vma->root = pvma->anon_vma->root;
+  anon_vma->parent = pvma->anon_vma;
+  /*
+   * With refcounts, an anon_vma can stay around longer than the
+   * process it belongs to. The root anon_vma needs to be pinned until
+   * this anon_vma is freed, because the lock lives in the root.
+   */
+  get_anon_vma(anon_vma->root);
+  /* Mark this anon_vma as the one where our new (COWed) pages go. */
+  vma->anon_vma = anon_vma;
+  anon_vma_lock_write(anon_vma);
+  anon_vma_chain_link(vma, avc, anon_vma);
+  anon_vma->parent->degree++;
+  anon_vma_unlock_write(anon_vma);
+
+  return 0;
+
+ out_error_free_anon_vma:
+  put_anon_vma(anon_vma);
+ out_error:
+  unlink_anon_vmas(vma);
+  return -ENOMEM;
+}
+
+static inline bool is_cow_mapping(vm_flags_t flags)
+{
+  return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
+}
+
+int copy_vm_pages(strcut mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm)
+{
+  pgd_t *src_pgd, *dst_pgd;
+  unsigned long next;
+  sturct vm_area_struct *vma = src_mm;
+  unsigned long src_start = src_vm->vm_start;
+  unsigned long src_end = src_vm->vm_end;
+  unsigned long dst_start = dst_vm->vm_start;
+  unsigned long dst_end = dst_vm->vm_end;
+  unsigned long addr, end;
+  bool is_cow;
+  int ret;
+
+  if (!(vma->vm_flags & (VM_HUGETLB | VM_NONLINEAR |
+			 VM_PFNMAP | VM_MIXEDMAP))) {
+    if (!vma->anon_vma)
+      return 0;
+  }
+
+  is_cow = is_cow_mapping(vma->vm_flags);
+  if (is_cow)
+    mmu_notifier_invalidate_range_start(src_mm, src_start,
+					src_end);
+  ret = 0;
+  dst_pgd = pgd_offset(dst_mm, dst_start);
+  src_pgd = pgd_offset(src_mm, src_start);
+  addr = src_start;
+  end = src_end;
+  do {
+    next_pgd_addr_end(addr, end);
+    if (pgd_none_or_clear_bad(src_pgd))
+      continue;
+    if (copy_pud_pages(dst_mm, src_mm, dst_pgd, src_pgd, dst_vm, src_vm, ))
+  } while (dst_pgd++, src_pgd++, addr = next, addr != end);
+  if (is_cow)
+    mmu_notifier_invalidate_range_end(src_mm, mmun_start, mmun_end);
+  return ret;
+}
+
+unsigned long copyvma(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm)
+{
+  int retval;
+  //dup_vma_policy
+  /*  retval = vma_dup_policy(src, dst);
+  if (retval)
+  goto fail_nomem_policy;*/
+  if (anon_vma_fork(dst_vm, src_vm))
+    goto fail_nomem_anon_vma_fork;
+  
+  //retval = copy_pgtable(dst, src);
+  ;
+  if (dst_vm->vm_ops && dst_vm->vm_ops->open)
+    dst_vm->vm_ops->open(dst_vm);
+
+  retval = copy_vma_pages(dst_mm, dst_vm, src_mm, src_vm);
+
+ fail_nomem_anon_vma_fork:
+  //  mpol_put(vma_policy(dst));
+ fail_nomem_policy:
+ fail_nomem:
+  retval = -ENOMEM; // free vma after return 
+  //goto out;
+
+}
 
 void * device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
   struct task_struct *ptr;
   struct mm_struct *target_mm, *current_mm;
   struct cow_monitor *cow;
-  struct vm_area_struct *target_vm, *tmp, *prev, **pprev;
+  struct vm_area_struct *target_vm, *tmp, *prev, **pprev, *dst_vm;
   struct rb_node **rb_link, *rb_parent;
   unsigned long addr;
   unsigned long flags, prot;
@@ -735,14 +1163,17 @@ void * device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
     // Here, we try mmap a region which has the same flag as target vm
     ////////////////////////////////
-    addr = cow_do_mmap_pgoff(0, cow->len, prot, flags, target_vm->vm_flags, 0);
+    addr = cow_do_mmap_pgoff(0, cow->len, prot, flags, target_vm->vm_flags, 0, dst_vm);
     printk("addr is %p\n", addr);
+
+    // Here, try to copy page table from target_vm to what we made just above.
+    copyvma(dst_vm, target_vm);
+
     if (target_mm != current_mm) up_write(&current_mm->mmap_sem);
     up_write(&target_mm->mmap_sem);
 
     cow->ret_addr = addr;
-    return addr
-;
+    return addr;
   }
   retval = 0;
  free_out:
@@ -759,6 +1190,22 @@ static struct file_operations fops = {
   .unlocked_ioctl = device_ioctl,
 };
 
+static void anon_vma_ctor(void *data)
+{
+  struct anon_vma *anon_vma = data;
+
+  init_rwsem(&anon_vma->rwsem);
+  atomic_set(&anon_vma->refcount, 0);
+  anon_vma->rb_root = RB_ROOT;
+}               
+                
+void __init anon_vma_init(void)
+{
+  anon_vma_cachep = kmem_cache_create("anon_vma", sizeof(struct anon_vma),
+				      0, SLAB_DESTROY_BY_RCU|SLAB_PANIC, anon_vma_ctor);
+  anon_vma_chain_cachep = KMEM_CACHE(anon_vma_chain, SLAB_PANIC);
+}
+
 int init_module(void)
 {
   int ret_val;
@@ -772,6 +1219,7 @@ int init_module(void)
   vm_area_cachep = KMEM_CACHE(vm_area_struct, SLAB_PANIC);
   filp_cachep = KMEM_CACHE(file, SLAB_PANIC);
   policy_cache = kmem_cache_create("numa_policy", sizeof(struct mempolicy), 0, SLAB_PANIC, NULL);
+  anon_vma_init();
   return 0;
 }
 
