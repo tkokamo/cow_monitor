@@ -1039,11 +1039,11 @@ static inline bool is_cow_mapping(vm_flags_t flags)
   return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
 }
 
-int copy_vm_pages(strcut mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm)
+int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm)
 {
   pgd_t *src_pgd, *dst_pgd;
   unsigned long next;
-  sturct vm_area_struct *vma = src_mm;
+  struct vm_area_struct *vma = src_mm;
   unsigned long src_start = src_vm->vm_start;
   unsigned long src_end = src_vm->vm_end;
   unsigned long dst_start = dst_vm->vm_start;
@@ -1068,13 +1068,13 @@ int copy_vm_pages(strcut mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   addr = src_start;
   end = src_end;
   do {
-    next_pgd_addr_end(addr, end);
+    //next_pgd_addr_end(addr, end);
     if (pgd_none_or_clear_bad(src_pgd))
       continue;
-    if (copy_pud_pages(dst_mm, src_mm, dst_pgd, src_pgd, dst_vm, src_vm, ))
+    //  if (copy_pud_pages(dst_mm, src_mm, dst_pgd, src_pgd, dst_vm, src_vm, ))
   } while (dst_pgd++, src_pgd++, addr = next, addr != end);
   if (is_cow)
-    mmu_notifier_invalidate_range_end(src_mm, mmun_start, mmun_end);
+    mmu_notifier_invalidate_range_end(src_mm, src_start, src_end);
   return ret;
 }
 
@@ -1093,7 +1093,7 @@ unsigned long copyvma(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, s
   if (dst_vm->vm_ops && dst_vm->vm_ops->open)
     dst_vm->vm_ops->open(dst_vm);
 
-  retval = copy_vma_pages(dst_mm, dst_vm, src_mm, src_vm);
+  //retval = copy_vma_pages(dst_mm, dst_vm, src_mm, src_vm);
 
  fail_nomem_anon_vma_fork:
   //  mpol_put(vma_policy(dst));
@@ -1169,7 +1169,7 @@ void * device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
     printk("addr is %p\n", addr);
 
     // Here, try to copy page table from target_vm to what we made just above.
-    copyvma(dst_vm, target_vm);
+    copyvma(current_mm, dst_vm, target_mm, target_vm);
 
     if (target_mm != current_mm) up_write(&current_mm->mmap_sem);
     up_write(&target_mm->mmap_sem);
