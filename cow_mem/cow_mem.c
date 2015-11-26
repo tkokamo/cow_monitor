@@ -621,6 +621,8 @@ unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t 
   vma->vm_flags |= VM_SOFTDIRTY;
 
   vma_set_page_prot(vma);
+  if (vma->vm_file)
+    printk("vm_file is not null!\n");
 
   return addr;
  free_vma:
@@ -638,7 +640,7 @@ unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned 
     printk(KERN_ALERT "invalid parameter\n");
     return -EINVAL;
   }
- 
+   
   if (!(flags & MAP_FIXED))
     addr = cow_round_hint_to_min(addr);
 
