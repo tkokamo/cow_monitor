@@ -1039,6 +1039,48 @@ static inline bool is_cow_mapping(vm_flags_t flags)
   return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
 }
 
+
+int copy_pte_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pmd_t *src_pmd, unsigned long addr, unsigned long end, unsigned long *i)
+{
+  
+}
+
+
+int copy_pmd_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pud_t *src_pud, unsigned long addr, unsigned long end, unsigned long *i)
+{
+  pmd_t *src_pmd;
+  unsigned long next;
+
+  src_pmd = pmd_offset(src_pud, addr);
+  do {     
+    next = pmd_addr_end(addr, end);
+   
+    if (pmd_none_or_clear_bad(src_pmd))
+      continue;
+    if (copy_pte_pages(dst_mm, dst_vm, src_mm, src_vm, src_pgd, addr, next, i)) {
+      return -ENOMEM;
+    }
+  } while (src_pmd++, addr = next, addr != end, *i += ((unsigned long) 1 << PMD_SHIFT), (addr != end) && (*i < length));
+  return 0;
+}
+
+
+
+int copy_pud_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pgd_t *src_pgd, unsigned long addr, unsigned long end, unsigned long *i)
+{
+  pud_t *src_pud;
+  src_pud = pud_offset(src_pgd, addr);
+  do {
+    next = pud_addr_end(addr, end);
+    if (pud_none_or_clear_bad(src_pud))
+      continue;
+    //
+    if (copy_pmd_pages()) {
+      return -ENOMEM;
+    }
+  } while (src_pud++, addr = next, *i += ((unsigned long) 1 << PUD_SHIFT), (addr != end) && (*i < length));
+}
+
 int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm)
 {
   pgd_t *src_pgd, *dst_pgd;
@@ -1049,6 +1091,7 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   unsigned long dst_start = dst_vm->vm_start;
   unsigned long dst_end = dst_vm->vm_end;
   unsigned long addr, end;
+  unsigned long *i, length;
   bool is_cow;
   int ret;
 
@@ -1067,12 +1110,15 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   src_pgd = pgd_offset(src_mm, src_start);
   addr = src_start;
   end = src_end;
+  length = end - addr;
   do {
     //next_pgd_addr_end(addr, end);
     if (pgd_none_or_clear_bad(src_pgd))
       continue;
-    //  if (copy_pud_pages(dst_mm, src_mm, dst_pgd, src_pgd, dst_vm, src_vm, ))
-  } while (dst_pgd++, src_pgd++, addr = next, addr != end);
+    if (copy_pud_pages(dst_mm, dst_vm, src_mm, src_vm, src_pgd, addr, next, i)) {
+      return -ENOMEM;
+    }
+  } while (src_pgd++, addr = next, *i += ((unsigned long) 1 << PGDIR_SHIFT), (addr != end) && (*i < length));
   if (is_cow)
     mmu_notifier_invalidate_range_end(src_mm, src_start, src_end);
   return ret;
