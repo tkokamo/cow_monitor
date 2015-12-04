@@ -50,6 +50,8 @@
 #include <linux/kconfig.h>
 #include <linux/interval_tree_generic.h>
 #include <linux/mmu_notifier.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 
 #include "cow_mem.h"
 #define DEVICE_NAME "cow_monitor" 
@@ -565,7 +567,7 @@ unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t 
   struct vm_area_struct *vma, *prev;
   int error;
   struct rb_node **rb_link, *rb_parent;
-  unsigned long charged = 0;
+  //unsigned long charged = 0;
   
   // omit the may_expand_vm section because vm_flags & MAP_FIXED will be 0
   
@@ -1039,104 +1041,254 @@ static inline bool is_cow_mapping(vm_flags_t flags)
   return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
 }
 
+struct pgtable_cache{
+  unsigned int pgd_idx, pud_idx, pmd_idx;
+  pgd_t *pgd_val;
+  pud_t *pud_val;
+  pmd_t *pmd_val;
+  spinlock_t *locked_ptl;
+};
 
-int copy_pte_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pmd_t *src_pmd, unsigned long addr, unsigned long end, unsigned long *i)
+pte_t *get_pte_and_lock(struct mm_struct *mm, unsigned long addr, struct pgtable_cache *ptc)
 {
-  static int copy_pte_range(struct mm_struct *dst_mm, struct mm_struct *src_mm,
-			    pmd_t *dst_pmd, pmd_t *src_pmd, struct vm_area_struct *vma,
-			    unsigned long addr, unsigned long end)
-  {
-    pte_t *orig_src_pte, *orig_dst_pte;
-    pte_t *src_pte, *dst_pte;
-    spinlock_t *src_ptl, *dst_ptl;
-    int progress = 0;
-    int rss[NR_MM_COUNTERS];
-    swp_entry_t entry = (swp_entry_t){0};
+  pgd_t *pgd_val;
+  pud_t *pud_val;
+  pmd_t *pmd_val;
+  pte_t *pte_val;
 
-  again:
-    init_rss_vec(rss);
+  if (pgd_index(addr) != ptc->pgd_idx)
+    goto pud_update;
+  pgd_val = ptc->pgd_val;
+  if (pud_index(addr) != ptc->pud_idx)
+    goto pmd_update;
+  pud_val = ptc->pud_val;
+  if (pmd_index(addr) != ptc->pmd_idx)
+    goto pte_update;
+  pmd_val = ptc->pmd_val;
+  pte_val = pte_offset_map(pmd_val, addr);
+  return pte_val;
 
-    dst_pte = pte_alloc_map_lock(dst_mm, dst_pmd, addr, &dst_ptl);
-    if (!dst_pte)
-      return -ENOMEM;
-    src_pte = pte_offset_map(src_pmd, addr);
-    src_ptl = pte_lockptr(src_mm, src_pmd);
-    spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
-    orig_src_pte = src_pte;
-    orig_dst_pte = dst_pte;
-    arch_enter_lazy_mmu_mode();
-
-    do {
-      /*
-       * We are holding two locks at this point - either of them
-       * could generate latencies in another task on another CPU.
-       */
-      if (progress >= 32) {
-	progress = 0;
-	if (need_resched() ||
-	    spin_needbreak(src_ptl) || spin_needbreak(dst_ptl))
-	  break;
-      }
-      if (pte_none(*src_pte)) {
-	progress++;
-	continue;
-      }
-      entry.val = copy_one_pte(dst_mm, src_mm, dst_pte, src_pte,
-			       vma, addr, rss);
-      if (entry.val)
-	break;
-      progress += 8;
-    } while (dst_pte++, src_pte++, addr += PAGE_SIZE, addr != end);
-
-    arch_leave_lazy_mmu_mode();
-    spin_unlock(src_ptl);
-    pte_unmap(orig_src_pte);
-    add_mm_rss_vec(dst_mm, rss);
-    pte_unmap_unlock(orig_dst_pte, dst_ptl);
-    cond_resched();
-
-    if (entry.val) {
-      if (add_swap_count_continuation(entry, GFP_KERNEL) < 0)
-	return -ENOMEM;
-      progress = 0;
-    }
-    if (addr != end)
-      goto again;
-    return 0;
+ pud_update:
+  pgd_val = pgd_offset(mm, addr);
+  ptc->pgd_val = pgd_val;
+  ptc->pgd_idx = pgd_index(addr);
+  pud_val = pud_alloc(mm, pgd_val, addr);
+ 
+ pmd_update:
+  pud_val = pud_offset(pgd_val, addr);
+  ptc->pud_val = pud_val;
+  ptc->pud_idx = pud_index(addr);
+  pmd_val = pmd_alloc(mm, pud_val, addr);
+  
+ pte_update:
+  pmd_val = pmd_offset(pud_val, addr);
+  ptc->pmd_val = pmd_val;
+  ptc->pmd_idx = pmd_index(addr);
+  if (ptc->locked_ptl != NULL) {
+    spin_unlock(ptc->locked_ptl);
+    ptc->locked_ptl = NULL;
   }
+  pte_val = pte_alloc_map_lock(mm, pmd_val, addr, &(ptc->locked_ptl));
+  
+  return pte_val;
 }
 
-
-int copy_pmd_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pud_t *src_pud, unsigned long addr, unsigned long end, unsigned long *i)
+static inline unsigned long
+copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+	     pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma,
+	     unsigned long addr, int *rss)
 {
-  pmd_t *src_pmd;
-  unsigned long next;
+  unsigned long vm_flags = vma->vm_flags;
+  pte_t pte = *src_pte;
+  struct page *page;
 
-  src_pmd = pmd_offset(src_pud, addr);
-  do {     
-    next = pmd_addr_end(addr, end);
-   
-    if (pmd_none_or_clear_bad(src_pmd))
-      continue;
-    if (copy_pte_pages(dst_mm, dst_vm, src_mm, src_vm, src_pmd, addr, next, i)) {
-      return -ENOMEM;
+  /* pte contains position in swap or file, so copy. */
+  if (unlikely(!pte_present(pte))) {
+    if (!pte_file(pte)) {
+      swp_entry_t entry = pte_to_swp_entry(pte);
+
+      if (likely(!non_swap_entry(entry))) {
+	if (swap_duplicate(entry) < 0)
+	  return entry.val;
+
+	/* make sure dst_mm is on swapoff's mmlist. */
+	if (unlikely(list_empty(&dst_mm->mmlist))) {
+	  spin_lock(&mmlist_lock);
+	  if (list_empty(&dst_mm->mmlist))
+	    list_add(&dst_mm->mmlist,
+		     &src_mm->mmlist);
+	  spin_unlock(&mmlist_lock);
+	}
+	rss[MM_SWAPENTS]++;
+      } else if (is_migration_entry(entry)) {
+	page = migration_entry_to_page(entry);
+
+	if (PageAnon(page))
+	  rss[MM_ANONPAGES]++;
+	else
+	  rss[MM_FILEPAGES]++;
+
+	if (is_write_migration_entry(entry) &&
+	    is_cow_mapping(vm_flags)) {
+	  /*
+	   * COW mappings require pages in both
+	   * parent and child to be set to read.
+	   */
+	  make_migration_entry_read(&entry);
+	  pte = swp_entry_to_pte(entry);
+	  if (pte_swp_soft_dirty(*src_pte))
+	    pte = pte_swp_mksoft_dirty(pte);
+	  set_pte_at(src_mm, addr, src_pte, pte);
+	}
+      }
     }
-  } while (src_pmd++, addr = next, addr != end, *i += ((unsigned long) 1 << PMD_SHIFT), (addr != end) && (*i < length));
+    goto out_set_pte;
+  }
+
+  /*
+   * If it's a COW mapping, write protect it both
+   * in the parent and the child
+   */
+  if (is_cow_mapping(vm_flags)) {
+    ptep_set_wrprotect(src_mm, addr, src_pte);
+    pte = pte_wrprotect(pte);
+  }
+
+  /*
+   * If it's a shared mapping, mark it clean in
+   * the child
+   */
+  if (vm_flags & VM_SHARED)
+    pte = pte_mkclean(pte);
+  pte = pte_mkold(pte);
+
+  page = vm_normal_page(vma, addr, pte);
+  if (page) {
+    get_page(page);
+    page_dup_rmap(page);
+    if (PageAnon(page))
+      rss[MM_ANONPAGES]++;
+    else
+      rss[MM_FILEPAGES]++;
+  }
+
+ out_set_pte:
+  set_pte_at(dst_mm, addr, dst_pte, pte);
   return 0;
 }
 
 
 
-int copy_pud_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pgd_t *src_pgd, unsigned long addr, unsigned long end, unsigned long *i)
+static inline void init_rss_vec(int *rss)
+{
+  memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
+}
+
+static inline void add_mm_rss_vec(struct mm_struct *mm, int *rss)
+{
+  int i;
+
+  if (current->mm == mm)
+    sync_mm_rss(mm);
+  for (i = 0; i < NR_MM_COUNTERS; i++)
+    if (rss[i])
+      add_mm_counter(mm, i, rss[i]);
+}
+
+
+int copy_pte_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pmd_t *src_pmd, unsigned long addr, unsigned long end, unsigned long *i, struct pgtable_cache *ptc)
+{
+  pte_t *orig_src_pte, *orig_dst_pte;
+  pte_t *src_pte, *dst_pte;
+  spinlock_t *src_ptl, *dst_ptl;
+  int progress = 0;
+  int rss[NR_MM_COUNTERS];
+  swp_entry_t entry = (swp_entry_t){0};
+  
+ again:
+  init_rss_vec(rss);
+  
+  dst_pte = get_pte_and_lock(dst_mm, addr, ptc);
+  if (!dst_pte)
+    return -ENOMEM;
+  src_pte = pte_offset_map(src_pmd, addr);
+  src_ptl = pte_lockptr(src_mm, src_pmd);
+  spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+  orig_src_pte = src_pte;
+  orig_dst_pte = dst_pte;
+  arch_enter_lazy_mmu_mode();
+  
+  do {
+    if (progress >= 32) {
+      progress = 0;
+      if (need_resched() ||
+	  spin_needbreak(src_ptl) || spin_needbreak(dst_ptl))
+	break;
+    }
+    if (pte_none(*src_pte)) {
+      progress++;
+      continue;
+    }
+    entry.val = copy_one_pte(dst_mm, src_mm, dst_pte, src_pte,
+			     src_vm, addr, rss);
+    if (entry.val)
+      break;
+    progress += 8;
+  } while (dst_pte++, src_pte++, addr += PAGE_SIZE, addr != end);
+  
+  arch_leave_lazy_mmu_mode();
+  spin_unlock(src_ptl);
+  pte_unmap(orig_src_pte);
+  add_mm_rss_vec(dst_mm, rss);
+  pte_unmap_unlock(orig_dst_pte, dst_ptl);
+  cond_resched();
+  
+  if (entry.val) {
+    if (add_swap_count_continuation(entry, GFP_KERNEL) < 0)
+      return -ENOMEM;
+    progress = 0;
+  }
+  if (addr != end)
+    goto again;
+  return 0;
+}
+
+
+int copy_pmd_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pud_t *src_pud, unsigned long addr, unsigned long end, unsigned long *i, struct pgtable_cache *ptc)
+{
+  pmd_t *src_pmd;
+  unsigned long next;
+  unsigned long length;
+
+  src_pmd = pmd_offset(src_pud, addr);
+  length = end - addr;
+  do {     
+    next = pmd_addr_end(addr, end);
+   
+    if (pmd_none_or_clear_bad(src_pmd))
+      continue;
+    if (copy_pte_pages(dst_mm, dst_vm, src_mm, src_vm, src_pmd, addr, next, i, ptc)) {
+      return -ENOMEM;
+    }
+  } while (src_pmd++, addr = next, *i += ((unsigned long) 1 << PMD_SHIFT), (addr != end) && (*i < length));
+  return 0;
+}
+
+
+
+int copy_pud_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm, pgd_t *src_pgd, unsigned long addr, unsigned long end, unsigned long *i, struct pgtable_cache *ptc)
 {
   pud_t *src_pud;
+  unsigned long next, length;
+
+  length = end - addr;
   src_pud = pud_offset(src_pgd, addr);
   do {
     next = pud_addr_end(addr, end);
     if (pud_none_or_clear_bad(src_pud))
       continue;
     //
-    if (copy_pmd_pages(dst_mm, dst_vm, src_mm, src_vm, src_pud, addr, next, i)) {
+    if (copy_pmd_pages(dst_mm, dst_vm, src_mm, src_vm, src_pud, addr, next, i, ptc)) {
       return -ENOMEM;
     }
   } while (src_pud++, addr = next, *i += ((unsigned long) 1 << PUD_SHIFT), (addr != end) && (*i < length));
@@ -1146,7 +1298,7 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
 {
   pgd_t *src_pgd, *dst_pgd;
   unsigned long next;
-  struct vm_area_struct *vma = src_mm;
+  struct vm_area_struct *vma = src_vm;
   unsigned long src_start = src_vm->vm_start;
   unsigned long src_end = src_vm->vm_end;
   unsigned long dst_start = dst_vm->vm_start;
@@ -1155,6 +1307,8 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   unsigned long *i, length;
   bool is_cow;
   int ret;
+  struct pgtable_cache ptc;
+  
 
   if (!(vma->vm_flags & (VM_HUGETLB | VM_NONLINEAR |
 			 VM_PFNMAP | VM_MIXEDMAP))) {
@@ -1172,11 +1326,12 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   addr = src_start;
   end = src_end;
   length = end - addr;
+  memset(&ptc, 0, sizeof(ptc));
   do {
     //next_pgd_addr_end(addr, end);
     if (pgd_none_or_clear_bad(src_pgd))
       continue;
-    if (copy_pud_pages(dst_mm, dst_vm, src_mm, src_vm, src_pgd, addr, next, i)) {
+    if (copy_pud_pages(dst_mm, dst_vm, src_mm, src_vm, src_pgd, addr, next, i, &ptc)) {
       return -ENOMEM;
     }
   } while (src_pgd++, addr = next, *i += ((unsigned long) 1 << PGDIR_SHIFT), (addr != end) && (*i < length));
