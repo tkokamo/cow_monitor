@@ -52,7 +52,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
-
+//#include <asm-generic/pgalloc.h>
 #include "cow_mem.h"
 #define DEVICE_NAME "cow_monitor" 
 
@@ -62,9 +62,19 @@ struct kmem_cache *policy_cache;
 struct kmem_cache *filp_cachep;
 static struct kmem_cache *anon_vma_cachep;
 static struct kmem_cache *anon_vma_chain_cachep;
-
+//static inline unsigned char swap_count(unsigned char ent)
+//{
+//  return ent & ~SWAP_HAS_CACHE;   /* may include SWAP_HAS_CONT flag */
+//}
 
 extern struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags);
+extern inline unsigned long
+copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+	     pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma,
+	     unsigned long addr, int *rss);
+extern int add_swap_count_continuation(swp_entry_t entry, gfp_t gfp_mask);
+
+//extern spinlock_t mmlist_lock;
 
 struct mnt_namespace {
   atomic_t                count;
@@ -1041,6 +1051,24 @@ static inline bool is_cow_mapping(vm_flags_t flags)
   return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
 }
 
+void pgd_clear_bad(pgd_t *pgd)
+{
+  pgd_ERROR(*pgd);
+  pgd_clear(pgd);
+}
+
+void pud_clear_bad(pud_t *pud)
+{
+  pud_ERROR(*pud);
+  pud_clear(pud);
+}
+
+void pmd_clear_bad(pmd_t *pmd)
+{
+  pmd_ERROR(*pmd);
+  pmd_clear(pmd);
+}
+
 struct pgtable_cache{
   unsigned int pgd_idx, pud_idx, pmd_idx;
   pgd_t *pgd_val;
@@ -1048,6 +1076,241 @@ struct pgtable_cache{
   pmd_t *pmd_val;
   spinlock_t *locked_ptl;
 };
+
+/*
+static int __swap_duplicate(swp_entry_t entry, unsigned char usage)
+{
+  struct swap_info_struct *p;
+  unsigned long offset, type;
+  unsigned char count;
+  unsigned char has_cache;
+  int err = -EINVAL; 
+
+  if (non_swap_entry(entry))
+    goto out;
+
+  type = swp_type(entry); 
+  if (type >= nr_swapfiles)
+    goto bad_file;
+  p = swap_info[type];
+  offset = swp_offset(entry);
+
+  spin_lock(&p->lock);
+  if (unlikely(offset >= p->max))
+    goto unlock_out;
+
+  count = p->swap_map[offset];
+
+  
+  if (unlikely(swap_count(count) == SWAP_MAP_BAD)) {
+    err = -ENOENT;
+    goto unlock_out;
+  }
+
+  has_cache = count & SWAP_HAS_CACHE;
+  count &= ~SWAP_HAS_CACHE;
+  err = 0;
+
+  if (usage == SWAP_HAS_CACHE) {
+
+    if (!has_cache && count)
+      has_cache = SWAP_HAS_CACHE;
+    else if (has_cache)            
+      err = -EEXIST;
+    else                           
+      err = -ENOENT;
+
+  } else if (count || has_cache) {
+
+    if ((count & ~COUNT_CONTINUED) < SWAP_MAP_MAX)
+      count += usage;
+    else if ((count & ~COUNT_CONTINUED) > SWAP_MAP_MAX)
+      err = -EINVAL;
+    else if (swap_count_continued(p, offset, count))
+      count = COUNT_CONTINUED;
+    else
+      err = -ENOMEM;
+  } else
+    err = -ENOENT;                 
+
+  p->swap_map[offset] = count | has_cache;
+
+ unlock_out:
+  spin_unlock(&p->lock);
+ out:
+  return err;
+
+ bad_file:
+  pr_err("swap_dup: %s%08lx\n", Bad_file, entry.val);
+  goto out;
+}
+
+
+int swap_duplicate(swp_entry_t entry)
+{
+  int err = 0;
+
+  while (!err && __swap_duplicate(entry, 1) == -ENOMEM)
+    err = add_swap_count_continuation(entry, GFP_ATOMIC);
+  return err;
+}
+*/
+
+#define PGALLOC_USER_GFP 0
+#define PGALLOC_GFP GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO
+
+pgtable_t pte_alloc_one(struct mm_struct *mm, unsigned long address)
+{       
+  struct page *pte;
+
+  pte = alloc_pages(PGALLOC_GFP | PGALLOC_USER_GFP, 0);
+  if (!pte)
+    return NULL;
+  if (!pgtable_page_ctor(pte)) {
+    __free_page(pte); 
+    return NULL;
+  }
+  return pte;
+}
+
+static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
+                                struct page *pte)
+{
+  unsigned long pfn = page_to_pfn(pte);
+
+  paravirt_alloc_pte(mm, pfn);
+  set_pmd(pmd, __pmd(((pteval_t)pfn << PAGE_SHIFT) | _PAGE_TABLE));
+} 
+
+static inline void pte_free(struct mm_struct *mm, struct page *pte)
+{
+  pgtable_page_dtor(pte);
+  __free_page(pte);
+}
+
+
+int __pte_alloc(struct mm_struct *mm, struct vm_area_struct *vma,
+                pmd_t *pmd, unsigned long address)
+{
+  spinlock_t *ptl;
+  pgtable_t new = pte_alloc_one(mm, address);
+  int wait_split_huge_page;
+  if (!new)
+    return -ENOMEM;
+
+  /*
+   * Ensure all pte setup (eg. pte page lock and page clearing) are
+   * visible before the pte is made visible to other CPUs by being
+   * put into page tables.
+   * 
+   * The other side of the story is the pointer chasing in the page
+   * table walking code (when walking the page table without locking;
+   * ie. most of the time). Fortunately, these data accesses consist
+   * of a chain of data-dependent loads, meaning most CPUs (alpha
+   * being the notable exception) will already guarantee loads are
+   * seen in-order. See the alpha page table accessors for the
+   * smp_read_barrier_depends() barriers in page table walking code.
+   */
+  smp_wmb(); /* Could be smp_wmb__xxx(before|after)_spin_lock */
+
+  ptl = pmd_lock(mm, pmd);
+  wait_split_huge_page = 0;
+  if (likely(pmd_none(*pmd))) {   /* Has another populated it ? */
+    atomic_long_inc(&mm->nr_ptes);
+    pmd_populate(mm, pmd, new);
+    new = NULL;
+  } else if (unlikely(pmd_trans_splitting(*pmd)))
+    wait_split_huge_page = 1;
+  spin_unlock(ptl);
+  if (new)
+    pte_free(mm, new);
+  if (wait_split_huge_page)
+    wait_split_huge_page(vma->anon_vma, pmd);
+  return 0;
+}
+
+
+static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long addr)
+{
+  struct page *page;
+  page = alloc_pages(GFP_KERNEL | __GFP_REPEAT | __GFP_ZERO, 0);
+  if (!page)
+    return NULL;
+  if (!pgtable_pmd_page_ctor(page)) {
+    __free_pages(page, 0);
+    return NULL;
+  }
+  return (pmd_t *)page_address(page);
+}
+
+static inline void pmd_free(struct mm_struct *mm, pmd_t *pmd)
+{
+  BUG_ON((unsigned long)pmd & (PAGE_SIZE-1));
+  pgtable_pmd_page_dtor(virt_to_page(pmd));
+  free_page((unsigned long)pmd);
+}
+
+static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
+{
+  paravirt_alloc_pmd(mm, __pa(pmd) >> PAGE_SHIFT);
+  set_pud(pud, __pud(_PAGE_TABLE | __pa(pmd)));
+}
+
+int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
+{
+  pmd_t *new = pmd_alloc_one(mm, address);
+  if (!new)
+    return -ENOMEM;
+
+  smp_wmb(); /* See comment in __pte_alloc */ 
+
+  spin_lock(&mm->page_table_lock);
+
+  if (pud_present(*pud))          /* Another has populated it */
+    pmd_free(mm, new);
+  else
+    pud_populate(mm, pud, new);
+  spin_unlock(&mm->page_table_lock);
+  return 0;
+}
+
+
+
+static inline void pgd_populate(struct mm_struct *mm, pgd_t *pgd, pud_t *pud)
+{
+  paravirt_alloc_pud(mm, __pa(pud) >> PAGE_SHIFT); 
+  set_pgd(pgd, __pgd(_PAGE_TABLE | __pa(pud)));
+}
+
+static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long addr)
+{
+  return (pud_t *)get_zeroed_page(GFP_KERNEL|__GFP_REPEAT);
+}
+
+static inline void pud_free(struct mm_struct *mm, pud_t *pud)
+{       
+  BUG_ON((unsigned long)pud & (PAGE_SIZE-1));
+  free_page((unsigned long)pud);
+}       
+
+
+int __pud_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
+{
+  pud_t *new = pud_alloc_one(mm, address);
+  if (!new)
+    return -ENOMEM;
+
+  smp_wmb(); /* See comment in __pte_alloc */
+
+  spin_lock(&mm->page_table_lock);
+  if (pgd_present(*pgd))          /* Another has populated it */
+    pud_free(mm, new);
+  else
+    pgd_populate(mm, pgd, new);
+  spin_unlock(&mm->page_table_lock);
+  return 0; 
+}
+
 
 pte_t *get_pte_and_lock(struct mm_struct *mm, unsigned long addr, struct pgtable_cache *ptc)
 {
@@ -1093,95 +1356,24 @@ pte_t *get_pte_and_lock(struct mm_struct *mm, unsigned long addr, struct pgtable
   return pte_val;
 }
 
-static inline unsigned long
-copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
-	     pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma,
-	     unsigned long addr, int *rss)
-{
-  unsigned long vm_flags = vma->vm_flags;
-  pte_t pte = *src_pte;
-  struct page *page;
-
-  /* pte contains position in swap or file, so copy. */
-  if (unlikely(!pte_present(pte))) {
-    if (!pte_file(pte)) {
-      swp_entry_t entry = pte_to_swp_entry(pte);
-
-      if (likely(!non_swap_entry(entry))) {
-	if (swap_duplicate(entry) < 0)
-	  return entry.val;
-
-	/* make sure dst_mm is on swapoff's mmlist. */
-	if (unlikely(list_empty(&dst_mm->mmlist))) {
-	  spin_lock(&mmlist_lock);
-	  if (list_empty(&dst_mm->mmlist))
-	    list_add(&dst_mm->mmlist,
-		     &src_mm->mmlist);
-	  spin_unlock(&mmlist_lock);
-	}
-	rss[MM_SWAPENTS]++;
-      } else if (is_migration_entry(entry)) {
-	page = migration_entry_to_page(entry);
-
-	if (PageAnon(page))
-	  rss[MM_ANONPAGES]++;
-	else
-	  rss[MM_FILEPAGES]++;
-
-	if (is_write_migration_entry(entry) &&
-	    is_cow_mapping(vm_flags)) {
-	  /*
-	   * COW mappings require pages in both
-	   * parent and child to be set to read.
-	   */
-	  make_migration_entry_read(&entry);
-	  pte = swp_entry_to_pte(entry);
-	  if (pte_swp_soft_dirty(*src_pte))
-	    pte = pte_swp_mksoft_dirty(pte);
-	  set_pte_at(src_mm, addr, src_pte, pte);
-	}
-      }
-    }
-    goto out_set_pte;
-  }
-
-  /*
-   * If it's a COW mapping, write protect it both
-   * in the parent and the child
-   */
-  if (is_cow_mapping(vm_flags)) {
-    ptep_set_wrprotect(src_mm, addr, src_pte);
-    pte = pte_wrprotect(pte);
-  }
-
-  /*
-   * If it's a shared mapping, mark it clean in
-   * the child
-   */
-  if (vm_flags & VM_SHARED)
-    pte = pte_mkclean(pte);
-  pte = pte_mkold(pte);
-
-  page = vm_normal_page(vma, addr, pte);
-  if (page) {
-    get_page(page);
-    page_dup_rmap(page);
-    if (PageAnon(page))
-      rss[MM_ANONPAGES]++;
-    else
-      rss[MM_FILEPAGES]++;
-  }
-
- out_set_pte:
-  set_pte_at(dst_mm, addr, dst_pte, pte);
-  return 0;
-}
-
 
 
 static inline void init_rss_vec(int *rss)
 {
   memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
+}
+
+void sync_mm_rss(struct mm_struct *mm)
+{
+  int i;
+
+  for (i = 0; i < NR_MM_COUNTERS; i++) {
+    if (current->rss_stat.count[i]) {
+      add_mm_counter(mm, i, current->rss_stat.count[i]);
+      current->rss_stat.count[i] = 0;
+    }              
+  }
+  current->rss_stat.events = 0;
 }
 
 static inline void add_mm_rss_vec(struct mm_struct *mm, int *rss)
@@ -1204,8 +1396,7 @@ int copy_pte_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
   int progress = 0;
   int rss[NR_MM_COUNTERS];
   swp_entry_t entry = (swp_entry_t){0};
-  
- again:
+again:
   init_rss_vec(rss);
   
   dst_pte = get_pte_and_lock(dst_mm, addr, ptc);
