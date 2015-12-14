@@ -39,17 +39,21 @@ int main()
   void *addr;
   char *p;
 
-  addr = mmap(NULL, 100, PROT_READ | PROT_EXEC | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-  ((char *)addr)[0] = 'a';
-  printf("addr = %c\n", ((char *)addr)[0]);
+  addr = mmap(NULL, 1000000, PROT_READ | PROT_EXEC | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  ((char *)addr)[90000] = 'a';
+  printf("addr = %c\n", ((char *)addr)[90000]);
 
-  ret_val = cow_mem(getpid(), addr, 100);
+  ret_val = cow_mem(getpid(), addr, 1000000);
   
   //  ((char *)ret_val)[0] = 'a';
   //printf("ret_val = %c\n", ((char *)ret_val)[0]);
   printf("addr = %p, ret = %p\n", addr, ret_val);
+  ((char *)addr)[90000] = 'b';
   p = ret_val;
-  p[0] = 1;
+  
+  printf("p[0] = %c\n", p[90000]);
+  p[9] = 'c';
+  printf("a[0] = %c, p[0] = %c\n", ((char *)addr)[90000], p[90000]);
 
   sleep(100);
 

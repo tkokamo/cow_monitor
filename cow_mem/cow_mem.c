@@ -52,7 +52,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
-//#include <asm-generic/pgalloc.h>
+#include <asm-generic/mm_hooks.h>
 #include "cow_mem.h"
 #define DEVICE_NAME "cow_monitor" 
 
@@ -73,6 +73,11 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 	     pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma,
 	     unsigned long addr, int *rss);
 extern int add_swap_count_continuation(swp_entry_t entry, gfp_t gfp_mask);
+//extern inline void arch_dup_mmap(struct mm_struct *oldmm,struct mm_struc:qt *mm);
+extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start, unsigned long end, unsigned long vmflag);
+#define TLB_FLUSH_ALL -1UL
+#define flush_tlb_mm(mm)        flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, 0UL)
+
 
 //extern spinlock_t mmlist_lock;
 
@@ -568,7 +573,7 @@ void vma_set_page_prot(struct vm_area_struct *vma)
   }       
 }  
 
-unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t vm_flags, unsigned long pgoff, struct vm_area_struct *dst_vm)
+unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t vm_flags, unsigned long pgoff, struct vm_area_struct **dst_vm_p)
 {
   /*
 
@@ -591,7 +596,7 @@ unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t 
   // no vma merge
 
   vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
-  dst_vm = vma;
+  *dst_vm_p = vma;
   if (!vma) {
     error = -ENOMEM;
     goto unacct_error;
@@ -634,14 +639,14 @@ unsigned long cow_mmap_region(unsigned long addr, unsigned long len, vm_flags_t 
 
   return addr;
  free_vma:
-  dst_vm = NULL;
+  *dst_vm_p = NULL;
   kmem_cache_free(vm_area_cachep, vma);
   
  unacct_error:  
   return error;
 }
 
-unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long vm_flags, unsigned long pgoff, struct vm_area_struct *dst_vm)
+unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long vm_flags, unsigned long pgoff, struct vm_area_struct **dst_vm_p)
 {
   //  unsigned long vm_flags;
 
@@ -675,7 +680,7 @@ unsigned long cow_do_mmap_pgoff(unsigned long addr, unsigned long len, unsigned 
   if (cow_mlock_future_check(current->active_mm, vm_flags, len))
     return -EAGAIN;
   
-  addr = cow_mmap_region(addr, len, vm_flags, pgoff, dst_vm);
+  addr = cow_mmap_region(addr, len, vm_flags, pgoff, dst_vm_p);
   /*if (!IS_ERR_VALUE(addr) &&
       ((vm_flags & VM_LOCKED) ||
        (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
@@ -996,24 +1001,29 @@ int anon_vma_fork(struct vm_area_struct *vma, struct vm_area_struct *pvma)
     return 0;
 
   /* Drop inherited anon_vma, we'll reuse existing or allocate new. */
+  printk(KERN_ALERT "vma->anon_vma\n");
   vma->anon_vma = NULL;
 
   /*
    * First, attach the new VMA to the parent VMA's anon_vmas,
    * so rmap can find non-COWed pages in child processes.
    */
+  printk(KERN_ALERT "anon_vma_clone\n");
   error = anon_vma_clone(vma, pvma);
   if (error)
     return error;
 
   /* An existing anon_vma has been reused, all done then. */
+  printk(KERN_ALERT "vma->anon_vma\n");
   if (vma->anon_vma)
     return 0;
 
   /* Then add our own anon_vma. */
+  printk(KERN_ALERT "alloc\n");
   anon_vma = anon_vma_alloc();
   if (!anon_vma)
     goto out_error;
+  printk(KERN_ALERT "chain_alloc\n");
   avc = anon_vma_chain_alloc(GFP_KERNEL);
   if (!avc)
     goto out_error_free_anon_vma;
@@ -1022,6 +1032,7 @@ int anon_vma_fork(struct vm_area_struct *vma, struct vm_area_struct *pvma)
    * The root anon_vma's spinlock is the lock actually used when we
    * lock any of the anon_vmas in this anon_vma tree.
    */
+  printk(KERN_ALERT "vma->root\n");
   anon_vma->root = pvma->anon_vma->root;
   anon_vma->parent = pvma->anon_vma;
   /*
@@ -1178,7 +1189,7 @@ static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
 {
   unsigned long pfn = page_to_pfn(pte);
 
-  paravirt_alloc_pte(mm, pfn);
+  //  paravirt_alloc_pte(mm, pfn);
   set_pmd(pmd, __pmd(((pteval_t)pfn << PAGE_SHIFT) | _PAGE_TABLE));
 } 
 
@@ -1252,7 +1263,7 @@ static inline void pmd_free(struct mm_struct *mm, pmd_t *pmd)
 
 static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
 {
-  paravirt_alloc_pmd(mm, __pa(pmd) >> PAGE_SHIFT);
+  //  paravirt_alloc_pmd(mm, __pa(pmd) >> PAGE_SHIFT);
   set_pud(pud, __pud(_PAGE_TABLE | __pa(pmd)));
 }
 
@@ -1278,7 +1289,7 @@ int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
 
 static inline void pgd_populate(struct mm_struct *mm, pgd_t *pgd, pud_t *pud)
 {
-  paravirt_alloc_pud(mm, __pa(pud) >> PAGE_SHIFT); 
+  //  paravirt_alloc_pud(mm, __pa(pud) >> PAGE_SHIFT); 
   set_pgd(pgd, __pgd(_PAGE_TABLE | __pa(pud)));
 }
 
@@ -1332,18 +1343,21 @@ pte_t *get_pte_and_lock(struct mm_struct *mm, unsigned long addr, struct pgtable
   return pte_val;
 
  pud_update:
+  printk(KERN_ALERT "pud_update\n");
   pgd_val = pgd_offset(mm, addr);
   ptc->pgd_val = pgd_val;
   ptc->pgd_idx = pgd_index(addr);
   pud_val = pud_alloc(mm, pgd_val, addr);
  
  pmd_update:
+  printk(KERN_ALERT "pmd_update\n");
   pud_val = pud_offset(pgd_val, addr);
   ptc->pud_val = pud_val;
   ptc->pud_idx = pud_index(addr);
   pmd_val = pmd_alloc(mm, pud_val, addr);
   
  pte_update:
+  printk(KERN_ALERT "ptd_update\n");
   pmd_val = pmd_offset(pud_val, addr);
   ptc->pmd_val = pmd_val;
   ptc->pmd_idx = pmd_index(addr);
@@ -1352,7 +1366,8 @@ pte_t *get_pte_and_lock(struct mm_struct *mm, unsigned long addr, struct pgtable
     ptc->locked_ptl = NULL;
   }
   pte_val = pte_alloc_map_lock(mm, pmd_val, addr, &(ptc->locked_ptl));
-  
+
+  printk(KERN_ALERT "1 dst pte \n");
   return pte_val;
 }
 
@@ -1398,23 +1413,32 @@ int copy_pte_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
   swp_entry_t entry = (swp_entry_t){0};
 again:
   init_rss_vec(rss);
-  
-  dst_pte = get_pte_and_lock(dst_mm, addr, ptc);
+  printk(KERN_ALERT "start copy_pte_pages\n");
+  dst_pte = get_pte_and_lock(dst_mm, dst_vm->vm_start + *i, ptc);
   if (!dst_pte)
     return -ENOMEM;
   src_pte = pte_offset_map(src_pmd, addr);
   src_ptl = pte_lockptr(src_mm, src_pmd);
-  spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+  if (dst_mm != src_mm)
+    spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
   orig_src_pte = src_pte;
   orig_dst_pte = dst_pte;
   arch_enter_lazy_mmu_mode();
   
   do {
+    printk(KERN_ALERT "pte loop\n");
+    dst_pte = get_pte_and_lock(dst_mm, dst_vm->vm_start + *i, ptc);
+    if (!dst_pte) {
+      printk(KERN_ALERT "dst_pte is null\n");
+      return -ENOMEM;
+    }
     if (progress >= 32) {
       progress = 0;
       if (need_resched() ||
-	  spin_needbreak(src_ptl) || spin_needbreak(dst_ptl))
+	  spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) {
+	printk(KERN_ALERT "break for resched\n");
 	break;
+      }
     }
     if (pte_none(*src_pte)) {
       progress++;
@@ -1422,17 +1446,24 @@ again:
     }
     entry.val = copy_one_pte(dst_mm, src_mm, dst_pte, src_pte,
 			     src_vm, addr, rss);
-    if (entry.val)
+    if (entry.val) {
+      printk(KERN_ALERT "entry val\n");
       break;
+    }
     progress += 8;
-  } while (dst_pte++, src_pte++, addr += PAGE_SIZE, addr != end);
-  
+    printk("start:%lx, next:%lx, end:%lx, *i:%lx\n", addr, addr + PAGE_SIZE, end, *i);
+  } while (src_pte++, *i += PAGE_SIZE, addr += PAGE_SIZE, addr != end);
+  printk("out ot loop start:%lx, end:%lx, *i:%lx\n", addr, end, *i);
+
+  dst_ptl = ptc->locked_ptl;
   arch_leave_lazy_mmu_mode();
-  spin_unlock(src_ptl);
+  if (dst_mm != src_mm)
+    spin_unlock(src_ptl);
   pte_unmap(orig_src_pte);
   add_mm_rss_vec(dst_mm, rss);
   pte_unmap_unlock(orig_dst_pte, dst_ptl);
   cond_resched();
+  printk(KERN_ALERT "comming here\n");
   
   if (entry.val) {
     if (add_swap_count_continuation(entry, GFP_KERNEL) < 0)
@@ -1453,15 +1484,19 @@ int copy_pmd_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
 
   src_pmd = pmd_offset(src_pud, addr);
   length = end - addr;
+  printk(KERN_ALERT "start:%lx,end:%lx,length:%lx\n", addr, end, length);
   do {     
+    printk(KERN_ALERT "1 pmd loop\n");
     next = pmd_addr_end(addr, end);
    
-    if (pmd_none_or_clear_bad(src_pmd))
+    if (pmd_none_or_clear_bad(src_pmd)) {
+      *i += ((unsigned long) 1 << PMD_SHIFT);
       continue;
+    }
     if (copy_pte_pages(dst_mm, dst_vm, src_mm, src_vm, src_pmd, addr, next, i, ptc)) {
       return -ENOMEM;
     }
-  } while (src_pmd++, addr = next, *i += ((unsigned long) 1 << PMD_SHIFT), (addr != end) && (*i < length));
+  } while (src_pmd++, addr = next, (addr != end) && (*i < length));
   return 0;
 }
 
@@ -1476,13 +1511,14 @@ int copy_pud_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
   src_pud = pud_offset(src_pgd, addr);
   do {
     next = pud_addr_end(addr, end);
-    if (pud_none_or_clear_bad(src_pud))
+    if (pud_none_or_clear_bad(src_pud)) {
+      *i += ((unsigned long) 1 << PUD_SHIFT);
       continue;
-    //
+    }
     if (copy_pmd_pages(dst_mm, dst_vm, src_mm, src_vm, src_pud, addr, next, i, ptc)) {
       return -ENOMEM;
     }
-  } while (src_pud++, addr = next, *i += ((unsigned long) 1 << PUD_SHIFT), (addr != end) && (*i < length));
+  } while (src_pud++, addr = next, (addr != end) && (*i < length));
 }
 
 int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm)
@@ -1495,7 +1531,7 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   unsigned long dst_start = dst_vm->vm_start;
   unsigned long dst_end = dst_vm->vm_end;
   unsigned long addr, end;
-  unsigned long *i, length;
+  unsigned long i, length;
   bool is_cow;
   int ret;
   struct pgtable_cache ptc;
@@ -1517,15 +1553,21 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   addr = src_start;
   end = src_end;
   length = end - addr;
+  i = 0;
   memset(&ptc, 0, sizeof(ptc));
+  printk("src_start: %p, src_end: %p, dst_start: %p, dst_end: %p, length: %ld\n", (void *)src_start, (void *)src_end, (void *)dst_start, (void *)dst_end, length);
   do {
-    //next_pgd_addr_end(addr, end);
-    if (pgd_none_or_clear_bad(src_pgd))
-      continue;
-    if (copy_pud_pages(dst_mm, dst_vm, src_mm, src_vm, src_pgd, addr, next, i, &ptc)) {
-      return -ENOMEM;
-    }
-  } while (src_pgd++, addr = next, *i += ((unsigned long) 1 << PGDIR_SHIFT), (addr != end) && (*i < length));
+     next = pgd_addr_end(addr, end);
+     if (pgd_none_or_clear_bad(src_pgd)) {
+       i += ((unsigned long) 1 << PGDIR_SHIFT);
+       continue;
+     }
+     if (copy_pud_pages(dst_mm, dst_vm, src_mm, src_vm, src_pgd, addr, next, &i, &ptc)) {
+       return -ENOMEM;
+     }
+  } while (src_pgd++, addr = next, addr != end && i < length);
+
+
   if (is_cow)
     mmu_notifier_invalidate_range_end(src_mm, src_start, src_end);
   return ret;
@@ -1541,11 +1583,23 @@ unsigned long copyvma(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, s
   if (anon_vma_fork(dst_vm, src_vm))
     goto fail_nomem_anon_vma_fork;
   
-  //retval = copy_pgtable(dst, src);
-  ;
+  //  retval = copy_pgtable(dst, src);
+  retval = copy_vm_pages(dst_mm, dst_vm, src_mm, src_vm);
   if (dst_vm->vm_ops && dst_vm->vm_ops->open)
     dst_vm->vm_ops->open(dst_vm);
 
+
+  if (retval)
+    goto out;
+
+  arch_dup_mmap(src_mm, dst_mm);
+  retval = 0;
+ out:
+  flush_tlb_mm(src_mm);
+  //  uprobe_end_dup_mmap();
+  
+  return retval;
+  
   //retval = copy_vma_pages(dst_mm, dst_vm, src_mm, src_vm);
 
  fail_nomem_anon_vma_fork:
@@ -1618,7 +1672,7 @@ void * device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
     // Here, we try mmap a region which has the same flag as target vm
     ////////////////////////////////
-    addr = cow_do_mmap_pgoff(0, cow->len, prot, flags, target_vm->vm_flags, 0, dst_vm);
+    addr = cow_do_mmap_pgoff(0, cow->len, prot, flags, target_vm->vm_flags, 0, &dst_vm);
     printk("addr is %p\n", addr);
 
     // Here, try to copy page table from target_vm to what we made just above.
