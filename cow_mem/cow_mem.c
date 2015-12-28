@@ -1426,7 +1426,7 @@ again:
   arch_enter_lazy_mmu_mode();
   
   do {
-    printk(KERN_ALERT "pte loop\n");
+    //    printk(KERN_ALERT "pte loop\n");
     dst_pte = get_pte_and_lock(dst_mm, dst_vm->vm_start + *i, ptc);
     if (!dst_pte) {
       printk(KERN_ALERT "dst_pte is null\n");
@@ -1454,6 +1454,8 @@ again:
     printk("start:%lx, next:%lx, end:%lx, *i:%lx\n", addr, addr + PAGE_SIZE, end, *i);
   } while (src_pte++, *i += PAGE_SIZE, addr += PAGE_SIZE, addr != end);
   printk("out ot loop start:%lx, end:%lx, *i:%lx\n", addr, end, *i);
+  if (  ptc->locked_ptl == NULL )
+    printk(KERN_ALERT "ptc->locked_ptl is NULL\n");
 
   dst_ptl = ptc->locked_ptl;
   arch_leave_lazy_mmu_mode();
@@ -1462,6 +1464,7 @@ again:
   pte_unmap(orig_src_pte);
   add_mm_rss_vec(dst_mm, rss);
   pte_unmap_unlock(orig_dst_pte, dst_ptl);
+  ptc->locked_ptl = NULL;
   cond_resched();
   printk(KERN_ALERT "comming here\n");
   
