@@ -52,7 +52,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
-#include <asm-generic/mm_hooks.h>
+//#include <asm-generic/mm_hooks.h> //On some platform, arch_dup/exit_mmap may be defined already. If not, uncomment this line
 #include "cow_mem.h"
 #define DEVICE_NAME "cow_monitor" 
 
@@ -1454,7 +1454,7 @@ again:
     printk("start:%lx, next:%lx, end:%lx, *i:%lx\n", addr, addr + PAGE_SIZE, end, *i);
   } while (src_pte++, *i += PAGE_SIZE, addr += PAGE_SIZE, addr != end);
   printk("out ot loop start:%lx, end:%lx, *i:%lx\n", addr, end, *i);
-  if (  ptc->locked_ptl == NULL )
+  if ( ptc->locked_ptl == NULL )
     printk(KERN_ALERT "ptc->locked_ptl is NULL\n");
 
   dst_ptl = ptc->locked_ptl;
@@ -1463,7 +1463,8 @@ again:
     spin_unlock(src_ptl);
   pte_unmap(orig_src_pte);
   add_mm_rss_vec(dst_mm, rss);
-  pte_unmap_unlock(orig_dst_pte, dst_ptl);
+  if ( ptc->locked_ptl != NULL )
+    pte_unmap_unlock(orig_dst_pte, dst_ptl);
   ptc->locked_ptl = NULL;
   cond_resched();
   printk(KERN_ALERT "comming here\n");
@@ -1493,13 +1494,15 @@ int copy_pmd_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
     next = pmd_addr_end(addr, end);
    
     if (pmd_none_or_clear_bad(src_pmd)) {
+      src_pmd = pmd_offset(src_pud, next);
       *i += ((unsigned long) 1 << PMD_SHIFT);
       continue;
     }
     if (copy_pte_pages(dst_mm, dst_vm, src_mm, src_vm, src_pmd, addr, next, i, ptc)) {
       return -ENOMEM;
     }
-  } while (src_pmd++, addr = next, (addr != end) && (*i < length));
+    src_pmd = pmd_offset(src_pud, next);
+  } while (addr = next, (addr != end) && (*i < length));
   return 0;
 }
 
