@@ -44,9 +44,9 @@ int main()
   
   printf("%d %lld\n", getpid(), (unsigned long long)addr);
   for (i = 0; i < 1000000000/4096; i++) {
-    ((char *)addr)[i*4096] = 'a';
+    ((char *)addr)[(unsigned long long)i*4096] = 'a';
   }
-  printf("addr[...] = %c\n", ((char *)addr)[4096* (1000000000/4096 - 10)]);
+  printf("addr[...] = %c\n", ((char *)addr)[4096*((unsigned long long)(1000000000/4096 - 10))]);
   printf("addr = %c\n", ((char *)addr)[4096]);
   
   sleep(20);

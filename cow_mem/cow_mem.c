@@ -1343,21 +1343,21 @@ pte_t *get_pte_and_lock(struct mm_struct *mm, unsigned long addr, struct pgtable
   return pte_val;
 
  pud_update:
-  printk(KERN_ALERT "pud_update\n");
+  //printk(KERN_ALERT "pud_update\n");
   pgd_val = pgd_offset(mm, addr);
   ptc->pgd_val = pgd_val;
   ptc->pgd_idx = pgd_index(addr);
   pud_val = pud_alloc(mm, pgd_val, addr);
  
  pmd_update:
-  printk(KERN_ALERT "pmd_update\n");
+  //printk(KERN_ALERT "pmd_update\n");
   pud_val = pud_offset(pgd_val, addr);
   ptc->pud_val = pud_val;
   ptc->pud_idx = pud_index(addr);
   pmd_val = pmd_alloc(mm, pud_val, addr);
   
  pte_update:
-  printk(KERN_ALERT "ptd_update\n");
+  // printk(KERN_ALERT "ptd_update\n");
   pmd_val = pmd_offset(pud_val, addr);
   ptc->pmd_val = pmd_val;
   ptc->pmd_idx = pmd_index(addr);
@@ -1367,7 +1367,7 @@ pte_t *get_pte_and_lock(struct mm_struct *mm, unsigned long addr, struct pgtable
   }
   pte_val = pte_alloc_map_lock(mm, pmd_val, addr, &(ptc->locked_ptl));
 
-  printk(KERN_ALERT "1 dst pte \n");
+  //  printk(KERN_ALERT "1 dst pte \n");
   return pte_val;
 }
 
@@ -1413,7 +1413,7 @@ int copy_pte_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
   swp_entry_t entry = (swp_entry_t){0};
 again:
   init_rss_vec(rss);
-  printk(KERN_ALERT "start copy_pte_pages\n");
+  //printk(KERN_ALERT "start copy_pte_pages\n");
   dst_pte = get_pte_and_lock(dst_mm, dst_vm->vm_start + *i, ptc);
   if (!dst_pte)
     return -ENOMEM;
@@ -1451,9 +1451,9 @@ again:
       break;
     }
     progress += 8;
-    printk("start:%lx, next:%lx, end:%lx, *i:%lx\n", addr, addr + PAGE_SIZE, end, *i);
+    //    printk("start:%lx, next:%lx, end:%lx, *i:%lx\n", addr, addr + PAGE_SIZE, end, *i);
   } while (src_pte++, *i += PAGE_SIZE, addr += PAGE_SIZE, addr != end);
-  printk("out ot loop start:%lx, end:%lx, *i:%lx\n", addr, end, *i);
+  //printk("out ot loop start:%lx, end:%lx, *i:%lx\n", addr, end, *i);
   if ( ptc->locked_ptl == NULL )
     printk(KERN_ALERT "ptc->locked_ptl is NULL\n");
 
@@ -1467,15 +1467,15 @@ again:
     pte_unmap_unlock(orig_dst_pte, dst_ptl);
   ptc->locked_ptl = NULL;
   cond_resched();
-  printk(KERN_ALERT "comming here\n");
+  //  printk(KERN_ALERT "comming here\n");
   
   if (entry.val) {
     if (add_swap_count_continuation(entry, GFP_KERNEL) < 0)
       return -ENOMEM;
     progress = 0;
   }
-  if (addr != end)
-    goto again;
+  if (addr != end)    
+    goto again;  
   return 0;
 }
 
@@ -1485,24 +1485,28 @@ int copy_pmd_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
   pmd_t *src_pmd;
   unsigned long next;
   unsigned long length;
-
+  unsigned long prev_i, current_i;
+  
   src_pmd = pmd_offset(src_pud, addr);
   length = end - addr;
   printk(KERN_ALERT "start:%lx,end:%lx,length:%lx\n", addr, end, length);
   do {     
     printk(KERN_ALERT "1 pmd loop\n");
     next = pmd_addr_end(addr, end);
-   
+    prev_i = *i;
     if (pmd_none_or_clear_bad(src_pmd)) {
       src_pmd = pmd_offset(src_pud, next);
-      *i += ((unsigned long) 1 << PMD_SHIFT);
+      *i += next - addr;
       continue;
     }
     if (copy_pte_pages(dst_mm, dst_vm, src_mm, src_vm, src_pmd, addr, next, i, ptc)) {
       return -ENOMEM;
     }
+    current_i = *i;
+    if (next - addr != current_i - prev_i) 
+      printk(KERN_ALERT "inc amount doesnt match!!!!\n");
     src_pmd = pmd_offset(src_pud, next);
-  } while (addr = next, (addr != end) && (*i < length));
+  } while (addr = next, (addr != end) /*&& (*i < length)*/);
   return 0;
 }
 
@@ -1512,19 +1516,27 @@ int copy_pud_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, stru
 {
   pud_t *src_pud;
   unsigned long next, length;
+  unsigned long prev_i, current_i; 
 
   length = end - addr;
   src_pud = pud_offset(src_pgd, addr);
   do {
     next = pud_addr_end(addr, end);
+    prev_i = *i;
     if (pud_none_or_clear_bad(src_pud)) {
-      *i += ((unsigned long) 1 << PUD_SHIFT);
+      *i += next - addr;
       continue;
     }
     if (copy_pmd_pages(dst_mm, dst_vm, src_mm, src_vm, src_pud, addr, next, i, ptc)) {
       return -ENOMEM;
     }
-  } while (src_pud++, addr = next, (addr != end) && (*i < length));
+    printk(KERN_ALERT "pud end of loop\n");
+    printk("next:%p, end:%p, *i:%ld, length:%ld,\n", next, end, *i, length);
+    current_i = *i;
+    if (next - addr != current_i - prev_i) 
+      printk(KERN_ALERT "inc amount doesnt match!!!!\n");
+  } while (src_pud++, addr = next, (addr != end) );
+  return 0;
 }
 
 int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struct mm_struct *src_mm, struct vm_area_struct *src_vm)
@@ -1541,7 +1553,7 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   bool is_cow;
   int ret;
   struct pgtable_cache ptc;
-  
+  unsigned long prev_i, current_i;
 
   if (!(vma->vm_flags & (VM_HUGETLB | VM_NONLINEAR |
 			 VM_PFNMAP | VM_MIXEDMAP))) {
@@ -1564,14 +1576,19 @@ int copy_vm_pages(struct mm_struct *dst_mm, struct vm_area_struct *dst_vm, struc
   printk("src_start: %p, src_end: %p, dst_start: %p, dst_end: %p, length: %ld\n", (void *)src_start, (void *)src_end, (void *)dst_start, (void *)dst_end, length);
   do {
      next = pgd_addr_end(addr, end);
+     prev_i = i;
      if (pgd_none_or_clear_bad(src_pgd)) {
-       i += ((unsigned long) 1 << PGDIR_SHIFT);
+       i += next - addr;
        continue;
      }
      if (copy_pud_pages(dst_mm, dst_vm, src_mm, src_vm, src_pgd, addr, next, &i, &ptc)) {
        return -ENOMEM;
      }
-  } while (src_pgd++, addr = next, addr != end && i < length);
+     current_i = i;
+     if (next - addr != current_i - prev_i) 
+       printk(KERN_ALERT "inc amount doesnt match!!!!\n");
+     printk("next:%p, end:%p\n", next, end);
+  } while (src_pgd++, addr = next, (addr != end));
 
 
   if (is_cow)
@@ -1678,16 +1695,20 @@ void * device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
     // Here, we try mmap a region which has the same flag as target vm
     ////////////////////////////////
-    addr = cow_do_mmap_pgoff(0, cow->len, prot, flags, target_vm->vm_flags, 0, &dst_vm);
+    addr = cow_do_mmap_pgoff(0, target_vm->vm_end - target_vm->vm_start, prot, flags, target_vm->vm_flags, 0, &dst_vm);
     printk("addr is %p\n", addr);
 
     // Here, try to copy page table from target_vm to what we made just above.
-    copyvma(current_mm, dst_vm, target_mm, target_vm);
+    retval = copyvma(current_mm, dst_vm, target_mm, target_vm);
+    if (retval) {
+      printk(KERN_ALERT "some errors occured\n");
+    }
 
     if (target_mm != current_mm) up_write(&current_mm->mmap_sem);
     up_write(&target_mm->mmap_sem);
 
     cow->ret_addr = addr;
+    printk(KERN_ALERT "cow_mem seems to finish\n");
     return addr;
   }
   retval = 0;
